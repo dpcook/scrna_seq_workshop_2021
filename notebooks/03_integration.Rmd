@@ -1,0 +1,172 @@
+---
+title: "Comparing different conditions with scRNA-seq"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+# Description
+It's becoming more common that people are interested in performing experiments containing multiple experimental conditions. Handling this can be tricky. We'll talk about data integration and differential expression between experimental conditions here.
+
+# Load package dependencies
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(tidyverse)
+```
+
+# Load the Seurat object
+
+We'll load some data from the SeuratData package that contains IFNB-Stimulated and Control PBMCs
+
+```{r}
+data(ifnb)
+```
+
+The loaded data isn't processed at all, so we'll fly through that
+
+```{r}
+seurat <- ifnb
+seurat <- NormalizeData(seurat)
+seurat <- FindVariableFeatures(seurat)
+seurat <- ScaleData(seurat)
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:30)
+seurat <- FindNeighbors(seurat, dims=1:30)
+seurat <- FindClusters(seurat, resolution=0.3)
+```
+
+# Quick exploration
+```{r}
+DimPlot(seurat, label=T)
+```
+
+```{r}
+DimPlot(seurat, group.by="seurat_annotations")
+```
+
+Whoa, there are two clusters of every cell type. Cool, right?!
+
+Not really.
+
+```{r}
+DimPlot(seurat, group.by="stim")
+```
+
+So how do we test the effects of stimulation on cell types? Some clusters contain both conditions (cluster 4 = NK & CD8 T), while others span multiple clusters (Cluster 0 & 3 = CD4 Naive T).
+
+# Integration
+The goal of integration is to find an embedding that aligns samples by a specific experimental or technical variable, negating its effects on the embedding. There are multiple methods for doing this, but here we'll stay in the Seurat echo system and use their approach.
+
+```{r}
+ifnb.list <- SplitObject(ifnb, split.by = "stim")
+
+ifnb.list <- lapply(ifnb.list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+features <- SelectIntegrationFeatures(object.list = ifnb.list)
+```
+
+```{r}
+immune.anchors <- FindIntegrationAnchors(object.list = ifnb.list, 
+                                         anchor.features = features)
+seurat <- IntegrateData(anchorset = immune.anchors)
+seurat
+```
+
+Notice that we have a new activate "assay" in our Seurat object: "integrated"
+This contains aligned expression values that allow us to re-run the normal pipeline and get an integrated embedding:
+
+```{r}
+seurat <- ScaleData(seurat)
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:30)
+seurat <- FindNeighbors(seurat, dims=1:30)
+seurat <- FindClusters(seurat, resolution=0.3)
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="stim")
+DimPlot(seurat, group.by="seurat_annotations", label=T)
+```
+
+Now our clusters correspond to individual cell types and are not separated by experimental condition. This is great because now we can take each cluster and do differential expression between conditions and this will tell us how each cell type is affected by stimulation. We'll get to that in a second.
+
+Integration is great to define unified clusters that aren't driven by experimental/technical variables. If this variable is an uninteresting technical feature (eg. batch effect), we can just continue with using this UMAP. But often in papers, we want unified clusters, but want out UMAPs to still show the effect of our experimental condition. To do this, you can switch back to the RNA assay (unintegrated data), and re-run PCA and UMAP but skip the clustering:
+```{r}
+DefaultAssay(seurat) <- "RNA"
+seurat <- FindVariableFeatures(seurat)
+seurat <- ScaleData(seurat)
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:30)
+#NO CLUSTERING--we'll keep the clusters from the last section
+```
+```{r}
+DimPlot(seurat, group.by="stim")
+DimPlot(seurat)
+```
+
+And we've maintained the unified clusters.
+
+## Differential expression between conditions
+**IMPORTANT:** A common mistake people make is that they integrate the data, but then keep using the integrated assay's "expression" values. These values have been transformed to eliminate the variable you've integrated on. They are important for integration itself, but no longer reflect expression values and also contain dependencies that violate common statistics.
+
+[**Even if you are using integrated data, you should use the RNA assay to look at gene expression and perform differential expression**]("https://github.com/satijalab/seurat/issues/1717")
+
+I already switch back to the RNA assay in the last section, but I will do it again to emphasize my point
+```{r}
+DefaultAssay(seurat) <- "RNA"
+seurat #print out the seurat object to confirm you are using the right assay
+```
+
+With n=1 for the conditions, you are a little limited to what types of tests you can do, but the most common approach is likely to use a Wilcoxon test between conditions, treating each cell as an individual measurement. **If you have replicates for conditions,** best practice is probably to perform differential expression using standard bulk RNA-seq methods on pseudobulk data (ie. summing up all gene counts across cells of a replicate in a specific cluster). Check out the R package [muscat](https://www.nature.com/articles/s41467-020-19894-4) for this. It performs pseudobulking and implements a variety of standard methods (DESeq, edgeR, etc).
+
+Let's just proceed with our n=1. Seurat's FindMarkers() function can perform the Wilcoxon test for us. I'll just perform differential expression for a single cell type / cluster (CD14 monocytes; cluster 0) here, but I'll include a function below that will iterate through this for all clusters
+
+```{r}
+mono_dge <- FindMarkers(seurat, ident.1="STIM", ident.2="CTRL",
+                        group.by="stim", #the metadata column that has experimental condition
+                        subset.ident = 0, #what cluster to subset and run this on
+                        logfc.threshold = 0.25, only.pos=F)
+```
+
+Here's a chunk of code if you want to run this differential expression across all clusters. We'll skip it for now
+```{r}
+#runDGE <- function(cluster){
+#  print(paste0("Running DGE for cluster: ", cluster))
+#  results <- FindMarkers(seurat, ident.1="STIM", ident.2="CTRL",
+#                         group.by="stim",
+#                         subset.ident = cluster,
+#                         logfc.threshold = 0.25,
+#                         only.pos=F)
+#  results$Cluster <- cluster
+#  return(results)
+#}
+
+#cluster_list <- unique(seurat$seurat_clusters)
+#dge_results <- lapply(cluster_list, runDGE)
+#dge_results <- do.call("rbind", dge_results)
+```
+
+
+```{r}
+mono_dge %>%
+  arrange(desc(avg_log2FC)) %>%
+  head()
+```
+
+```{r}
+FeaturePlot(seurat, features="CCL8", cols=c('lightgrey', 'red'))
+```
+
+```{r}
+VlnPlot(seurat, features="CCL8",
+        split.by="stim", idents=0)
+```
+
